@@ -1,60 +1,110 @@
-
 import torch as tr
 from torch.utils.data.sampler import BatchSampler, SubsetRandomSampler
-class ReplayBuffer(object):
-    def __init__(self,num_player,capacity=50000):
-        # in own turn
-        self.obss = [[] for _ in range(num_player)]
-        self.acts = [[] for _ in range(num_player)]
-        self.rews = [[] for _ in range(num_player)]
-        self.dones = [[] for _ in range(num_player)]
-        self.legals = [[] for _ in range(num_player)]
-        self.pis = [[] for _ in range(num_player)]
-        # all turn
-        self.capcity = capacity
-        self.offset = [[None,0,1,2],[2,None,0,1],[1,2,None,0],[0,1,2,None]]
-        self.add_count = 0
-        self.num_player = num_player
-    def clear(self):
-        self.obss = [[] for _ in range(self.num_player)]
-        self.acts = [[] for _ in range(self.num_player)]
-        self.rews = [[] for _ in range(self.num_player)]
-        self.dones = [[] for _ in range(self.num_player)]
-        self.legals = [[] for _ in range(self.num_player)]
-        self.pis = [[] for _ in range(self.num_player)]
-        self.add_count = 0
-    def add(self,curr,obs,act,rew,done,legal,p):
-        self.obss[curr].append(obs)
-        self.acts[curr].append(act)
-        self.rews[curr].append(rew)
-        self.dones[curr].append(done)
-        self.legals[curr].append(legal)
-        self.pis[curr].append(p)
-    def compute_return(self,next_value,use_gae,gamma,gae_lambda,use_proper_time_limits):
-        ## to fix
+
+
+def _flatten_helper(T, N, _tensor):
+    return _tensor.view(T * N, *_tensor.size()[2:])
+
+
+class RolloutStorage(object):
+    def __init__(self, batch_size , num_agent, obs_shape):
+        self.obss = tr.zeros(num_agent, batch_size + 1, *obs_shape)
+        self.rews = tr.zeros(num_agent, batch_size, 1)
+        self.value_preds = tr.zeros(num_agent, batch_size + 1, 1)
+        self.rets = tr.zeros(num_agent, batch_size + 1, 1)
+        self.action_log_probs = tr.zeros(num_agent, batch_size, 1)
+        self.legal_actions = tr.zeros(num_agent,batch_size,1)
+        self.acts = tr.zeros(num_agent,batch_size, 1)
+        self.acts = self.acts.long()
+        self.masks = tr.ones(num_agent,batch_size + 1, 1)
+
+        # Masks that indicate whether it's a true terminal state
+        # or time limit end state
+        self.bad_masks = tr.ones(num_agent,batch_size + 1, 1)
+        self.batch_size = batch_size
+        self.step = 0
+
+    def cuda(self):
+        self.obss = self.obss.cuda()
+        self.rews = self.rews.cuda()
+        self.value_preds = self.value_preds
+        self.rets = self.rets.cuda()
+        self.action_log_probs = self.action_log_probs.cuda()
+        self.acts = self.acts.cuda()
+        self.masks = self.masks.cuda()
+        self.bad_masks = self.bad_masks.cuda()
+
+    def insert(self, curr, obs, acts, action_log_probs,
+               value_preds, rewards, masks, bad_masks):
+        self.obss[curr][self.step + 1].copy_(obs)
+        self.acts[curr][self.step].copy_(acts)
+        self.action_log_probs[curr][self.step].copy_(action_log_probs)
+        self.value_preds[curr][self.step].copy_(value_preds)
+        self.rews[curr][self.step].copy_(rewards)
+        self.masks[curr][self.step + 1].copy_(masks)
+        self.bad_masks[curr][self.step + 1].copy_(bad_masks)
+
+        self.step = (self.step + 1) % self.batch_size
+
+    def after_update(self):
+        self.obss[0].copy_(self.obss[-1])
+        self.masks[0].copy_(self.masks[-1])
+        self.bad_masks[0].copy_(self.bad_masks[-1])
+
+    def compute_returns(self,
+                        curr,
+                        next_value,
+                        use_gae,
+                        gamma,
+                        gae_lambda,
+                        use_proper_time_limits=True):
         if use_proper_time_limits:
             if use_gae:
-                self.vals[-1] = next_value
+                self.value_predsp[curr][-1] = next_value
                 gae = 0
-                for step in reversed(range(self.rews.size(0))):
-                    delta = self.rews[step] + gamma*self.vals[step+1]-self.vals[step]
-                    gae = delta + gamma*gae_lambda*gae
-                    self.rets[step] = gae + self.vals[step]
+                for step in reversed(range(self.rews[curr].size(0))):
+                    delta = self.rews[curr][step] + gamma * self.value_preds[curr][step + 1] * \
+                            self.masks[curr][step + 1] - self.value_preds[curr][step]
+                    gae = delta + gamma * gae_lambda * self.masks[curr][step + 1] * gae
+                    gae = gae * self.bad_masks[curr][step + 1]
+                    self.rets[step] = gae + self.value_preds[step]
             else:
-                self.rets[-1] = next_value
-                for step in reversed(range(self.rews.size(0))):
-                    self.rets[step] = self.vals[step]
-    def get_batch(self,curr,advantages):
-        sampler = BatchSampler(SubsetRandomSampler(range(batch_size)),mini_batch_size,drop_last=True)
+                self.rets[curr][-1] = next_value
+                for step in reversed(range(self.rews[curr].size(0))):
+                    self.rets[curr][step] = (self.rets[curr][step + 1] * \
+                        gamma * self.masks[curr][step + 1] + self.rews[curr][step]) * self.bad_masks[curr][step + 1] \
+                        + (1 - self.bad_masks[curr][step + 1]) * self.value_preds[curr][step]
+        else:
+            if use_gae:
+                self.value_preds[curr][-1] = next_value
+                gae = 0
+                for step in reversed(range(self.rews[curr].size(0))):
+                    delta = self.rews[curr][step] + gamma * self.value_preds[curr][step + 1] \
+                            * self.masks[curr][step + 1] - self.value_preds[curr][step]
+                    gae = delta + gamma * gae_lambda * self.masks[curr][step + 1] * gae
+                    self.rets[curr][step] = gae + self.value_preds[curr][step]
+            else:
+                self.rets[curr][-1] = next_value
+                for step in reversed(range(self.rews[curr].size(0))):
+                    self.rets[curr][step] = self.rets[curr][step + 1] * \
+                        gamma * self.masks[curr][step + 1] + self.rews[curr][step]
+
+    def feed_forward_generator(self,curr,advantages):
+        num_agent, batch_size = self.rews[curr].size()[0:2]
+        sampler = BatchSampler(
+            SubsetRandomSampler(range(batch_size)),
+            batch_size,
+            drop_last=True)
         for indices in sampler:
-            obss = self.obss[curr][:-1].view(-1,*self.obss[curr].size()[2:])[indices]
-            acts = self.acts[curr].view(-1,self.acts[curr].size())[indices]
-            vals = self.vals[curr][:-1].view(-1,1)[indices]
-            rets = self.rets[curr][:-1].view(-1,1)[indices]
-            old_log_probs_batch = self.log_probs[curr].view(-1,1)[indices]
+            obs_batch = self.obss[curr][:-1].view(-1, *self.obss[curr].size()[2:])[indices]
+            actions_batch = self.acts[curr].view(-1,self.acts[curr].size(-1))[indices]
+            value_preds_batch = self.value_preds[:-1].view(-1, 1)[indices]
+            return_batch = self.rets[curr][:-1].view(-1, 1)[indices]
+            masks_batch = self.masks[curr][:-1].view(-1, 1)[indices]
+            old_action_log_probs_batch = self.action_log_probs[curr].view(-1,1)[indices]
             if advantages is None:
                 adv_targ = None
             else:
                 adv_targ = advantages.view(-1, 1)[indices]
 
-            yield obss, acts, vals, rets, old_log_probs_batch, adv_targ
+            yield obs_batch, actions_batch, value_preds_batch, return_batch, masks_batch, old_action_log_probs_batch, adv_targ

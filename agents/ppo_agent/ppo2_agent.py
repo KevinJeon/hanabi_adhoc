@@ -72,7 +72,7 @@ class DBPLAgent(object):
     self.num_player = num_player
     self.num_belief = num_belief
     self.num_action = num_action
-    self.memory = ReplayBuffer(num_player)
+    self.memory = RolloutStorage(batch_size=64,num_agent=num_player,obs_shape=num_state)
     if not os.path.exists(log_dir):
       os.mkdir(log_dir)
     self.writer = SummaryWriter(log_dir)
