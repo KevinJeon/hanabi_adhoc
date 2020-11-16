@@ -8,7 +8,7 @@ def _flatten_helper(T, N, _tensor):
 
 class RolloutStorage(object):
     def __init__(self, batch_size , num_agent, obs_shape):
-        self.obss = tr.zeros(num_agent, batch_size + 1, *obs_shape)
+        self.obss = tr.zeros(num_agent, batch_size + 1, obs_shape)
         self.rews = tr.zeros(num_agent, batch_size, 1)
         self.value_preds = tr.zeros(num_agent, batch_size + 1, 1)
         self.rets = tr.zeros(num_agent, batch_size + 1, 1)
@@ -31,25 +31,18 @@ class RolloutStorage(object):
         self.rets = self.rets.cuda()
         self.action_log_probs = self.action_log_probs.cuda()
         self.acts = self.acts.cuda()
-        self.masks = self.masks.cuda()
-        self.bad_masks = self.bad_masks.cuda()
 
-    def insert(self, curr, obs, acts, action_log_probs,
-               value_preds, rewards, masks, bad_masks):
+    def insert(self, curr, obs, acts, action_log_probs,value_preds, rewards):
         self.obss[curr][self.step + 1].copy_(obs)
         self.acts[curr][self.step].copy_(acts)
         self.action_log_probs[curr][self.step].copy_(action_log_probs)
         self.value_preds[curr][self.step].copy_(value_preds)
         self.rews[curr][self.step].copy_(rewards)
-        self.masks[curr][self.step + 1].copy_(masks)
-        self.bad_masks[curr][self.step + 1].copy_(bad_masks)
 
         self.step = (self.step + 1) % self.batch_size
 
     def after_update(self):
         self.obss[0].copy_(self.obss[-1])
-        self.masks[0].copy_(self.masks[-1])
-        self.bad_masks[0].copy_(self.bad_masks[-1])
 
     def compute_returns(self,
                         curr,

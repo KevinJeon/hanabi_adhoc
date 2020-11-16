@@ -32,7 +32,7 @@ import time
 from third_party.dopamine import checkpointer
 from third_party.dopamine import iteration_statistics
 import dqn_agent
-import ppo_agent
+import ppo2_agent
 import gin.tf
 import sys
 sys.path.append('/home/kevinjeon/hanabi_jeon/hanabi-learning-environment')
@@ -174,7 +174,7 @@ def create_agent(environment, obs_stacker, agent_type='DQN',log_dir='3'):
         num_actions=environment.num_moves(),
         num_players=environment.players)
   elif agent_type == 'Dec_AC':
-    return ppo_agent.DBPLAgent(
+    return ppo2_agent.DBPLAgent(
         num_state=obs_stacker.observation_size(),
         num_hidden=512,
         num_belief=125,
@@ -311,7 +311,7 @@ def run_one_episode(agent, environment, obs_stacker):
   step_number = 0
   # Keep track of per-player reward.
   reward_since_last_action = np.zeros(environment.players)
-  action, logprobs = agent.step(reward_since_last_action[current_player],
+  value, action, logprobs = agent.step(reward_since_last_action[current_player],
                                 current_player, legal_moves, observation_vector, is_done, begin=True)
   has_played = {current_player}
   while not is_done:
@@ -334,7 +334,7 @@ def run_one_episode(agent, environment, obs_stacker):
       # Each player begins the episode on their first turn (which may not be
       # the first move of the game).
     actioned.append(int(action.numpy()))
-    # Reset this player's reward accumulator.
+    # Reset this player's reward accumulator.g
     reward_since_last_action[current_player] = 0
   agent.end_episode(reward_since_last_action)
 

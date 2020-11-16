@@ -2,46 +2,53 @@
 from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
-
 import numpy as np
 import torch as tr
 import torch.nn as nn
-from torch.optim import Adam
 import torch.nn.functional as F
+from torch.optim import Adam
+from replay_memory import RolloutStorage
 from torch.distributions import Categorical
-from replay_memory import ReplayBuffer
 from torch.utils.tensorboard import SummaryWriter
 import os
 
+def init(layer,actor=False):
+  if actor:
+    nn.init.orthogonal_(layer.weight.data, gain=0.01)
+    nn.init.constant_(layer.bias.data, 0)
+
+  elif type(layer) == nn.Linear:
+    nn.init.orthogonal_(layer.weight.data,gain=np.sqrt(2))
+    nn.init.constant_(layer.bias.data,0)
 
 class Policy(nn.Module):
   def __init__(self, num_obs, num_action,num_hidden=512):
     super(Policy, self).__init__()
-    init_ = lambda m: init(m, nn.init.orthogonal_, lambda x: nn.init.
-                           constant_(x, 0), nn.init.calculate_gain('relu'))
     self.actor = nn.Sequential(
-      init_(nn.Linear(num_obs,num_hidden),nn.Tanh()),
-      init_(nn.Linear(num_hidden,num_hidden),nn.Tanh())
+      nn.Linear(num_obs,num_hidden),nn.Tanh(),
+      nn.Linear(num_hidden,num_hidden),nn.Tanh(),
     )
+    self.actor.apply(init)
     self.critic = nn.Sequential(
-      init_(nn.Linear(num_obs, num_hidden), nn.Tanh()),
-      init_(nn.Linear(num_hidden, num_hidden), nn.Tanh())
+      nn.Linear(num_obs, num_hidden), nn.Tanh(),
+      nn.Linear(num_hidden, num_hidden), nn.Tanh()
     )
-    self.critic_linear = init_(nn.Linear(num_hidden,1))
-
-    self.dist = Categorical(num_hidden, num_action)
+    self.critic.apply(init)
+    self.critic_linear = nn.Linear(num_hidden,1)
+    self.actor_linear = nn.Linear(num_hidden,num_action)
+    init(self.critic_linear)
+    init(self.actor_linear,actor=True)
   def forward(self, observations):
     raise NotImplementedError
 
   def act(self, observations, legal_actions):
     v = self.critic_linear(self.critic(observations))
     h_a = self.actor(observations)
-    h_a[legal_actions!=0] = 0
-    dist = self.dist(h_a)
-    action = dist.sample()
-    action_log_probs = dist.log_probs(action)
-    dist_entropy = dist.entropy().mean()
-
+    act_probs = F.sigmoid(self.actor_linear(h_a))
+    act_probs[legal_actions != 0] = 0
+    dist = Categorical(act_probs)
+    action = dist.sample().unsqueeze(-1)
+    action_log_probs = dist.log_prob(action)
     return v, action, action_log_probs
 
   def get_value(self, observations):
@@ -59,12 +66,14 @@ class Policy(nn.Module):
     return v, action_log_probs, dist_entropy
 
 class DBPLAgent(object):
-  def __init__(self,num_state,num_action,num_hidden,num_belief,num_player,log_dir,eps=0.2):
+  def __init__(self,num_state,num_action,num_hidden,num_belief,num_player,log_dir,
+               eps=1e-5,clip_param=0.2,value_loss_coef=0.5,entropy_coef=0.01,max_grad_norm=0.5,
+               use_clipped_value_loss=True):
     self.policy_modules = [None for _ in range(num_player)]
     self.old_policy_modules = [None for _ in range(num_player)]
     for i in range(num_player):
-      self.policy_modules[i] = PolicyNet(num_state,num_action,num_hidden).cuda()
-      self.old_policy_modules[i] = PolicyNet(num_state, num_action, num_hidden).cuda()
+      self.policy_modules[i] = Policy(num_state,num_action,num_hidden).cuda()
+      self.old_policy_modules[i] = Policy(num_state, num_action, num_hidden).cuda()
     self.num_player = num_player
     self.num_belief = num_belief
     self.num_action = num_action
@@ -86,33 +95,24 @@ class DBPLAgent(object):
 
     self.p_optim = [Adam(self.policy_modules[i].parameters(),lr=10e-4,eps=eps) for i in range(num_player)]
     self.gamma = 0.99
-    self.k = 3
-    self.batch_size = 64
+    self.k = 4
+    self.batch_size = 640
     self.iter = [0]*2
   def step(self,reward,current_player,legal_moves,observation_vector,is_done,begin=False):
 
     self._train()
     # train step
-    self.action,logprobs  = self._select_action(current_player,observation_vector,legal_moves)
-    self.memory.add_count += 1
-    if begin:
-      self.memory.add(current_player,np.array(observation_vector,dtype=np.uint8,copy=True),
-                      np.eye(self.num_action)[self.action],0,is_done,legal_moves,logprobs)
-    else:
-      self.memory.add(current_player, np.array(observation_vector, dtype=np.uint8, copy=True),
-                      np.eye(self.num_action)[self.action], reward, is_done, legal_moves, logprobs)
-    return self.action,logprobs
+    value, self.action, logprobs  = self._select_action(current_player,observation_vector,legal_moves)
+    
+    return value, self.action, logprobs
 
   def end_episode(self,reward_since_last_action):
-    for i,reward in enumerate(reward_since_last_action):
-      self.memory.rews[i].append(reward)
-      self.memory.rews[i] = self.memory.rews[i][1:]
     self._train(end=True)
 
   def _train(self,end=False):
     if self.eval_mode:
       return
-    if (self.memory.add_count >= self.batch_size) or (end == True):
+    if (self.memory.step >= self.batch_size) or (end == True):
       #print('end',end,'memory_count',self.memory.add_count)
       for i in range(self.num_player):
         self.iter[i] += 1
@@ -160,6 +160,7 @@ class DBPLAgent(object):
   def _select_action(self,current_player,observation,legal_actions):
     observation = tr.from_numpy(observation).float().cuda()
     with tr.no_grad():
-      action,dist = self.old_policy_modules[current_player].act(observation,legal_actions)
-    return action,dist.log_prob(action)
+      value,action,log_probs = self.old_policy_modules[current_player].act(observation,legal_actions)
+    print(value.size(),action.size(),log_probs.size())
+    return value,action,log_probs
 

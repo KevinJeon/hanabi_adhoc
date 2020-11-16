@@ -1,5 +1,4 @@
 import dqn_agent
-import decac_agent
 import run_experiment
 
 # This configures the DQN Agent.
