@@ -289,7 +289,7 @@ def parse_observations(observations, num_actions, obs_stacker):
   return current_player, legal_moves, observation_vector
 
 
-def run_one_episode(agent, environment, obs_stacker):
+def run_one_episode(agent, environment, obs_stacker,eval=False):
   """Runs the agent on a single game of Hanabi in self-play mode.
 
   Args:
@@ -301,7 +301,10 @@ def run_one_episode(agent, environment, obs_stacker):
     step_number: int, number of actions in this episode.
     total_reward: float, undiscounted return for this episode.
   """
-  actioned = []
+  if eval:
+    agent.eval_mode = True
+  else:
+    agent.eval_mode = False
   obs_stacker.reset_stack()
   observations = environment.reset()
   current_player, legal_moves, observation_vector = (
@@ -311,34 +314,55 @@ def run_one_episode(agent, environment, obs_stacker):
   step_number = 0
   # Keep track of per-player reward.
   reward_since_last_action = np.zeros(environment.players)
-  value, action, logprobs = agent.step(reward_since_last_action[current_player],
-                                current_player, legal_moves, observation_vector, is_done, begin=True)
-  has_played = {current_player}
+  has_played = []
+  avg_act_loss = [[] for _ in range(environment.players)]
+  avg_val_loss = [[] for _ in range(environment.players)]
+  actioned = [[] for _ in range(environment.players)]
   while not is_done:
+    # action
+    if current_player not in has_played:
+      has_played.append(current_player)
+      value, action, logprobs,act_loss,val_loss = agent.step(reward_since_last_action[current_player],
+                                  current_player, legal_moves, observation_vector,is_done,begin=True)
+    else:
+      value, action, logprobs,act_loss,val_loss  = agent.step(reward_since_last_action[current_player],
+                                    current_player, legal_moves, observation_vector,is_done)
+      reward_since_last_action[current_player] = 0
+    # step
+    actioned[current_player].append(int(action.cpu().numpy()))
     observations, reward, is_done, _ = environment.step(action.item())
     modified_reward = max(reward, 0) if LENIENT_SCORE else reward
     reward_since_last_action += modified_reward
     total_reward += modified_reward
     step_number += 1
+    # done
+    if act_loss:
+        for i,(a,v) in enumerate(zip(act_loss,val_loss)):
+            avg_act_loss[i].append(a)
+            avg_val_loss[i].append(v)
     if is_done:
         break
     current_player, legal_moves, observation_vector = (
         parse_observations(observations, environment.num_moves(), obs_stacker))
-    if current_player not in has_played:
-      has_played.add(current_player)
-      action, logprobs = agent.step(reward_since_last_action[current_player],
-                                  current_player, legal_moves, observation_vector,is_done,begin=True)
-    else:
-      action, logprobs = agent.step(reward_since_last_action[current_player],
-                                    current_player, legal_moves, observation_vector,is_done)
       # Each player begins the episode on their first turn (which may not be
       # the first move of the game).
-    actioned.append(int(action.numpy()))
     # Reset this player's reward accumulator.g
-    reward_since_last_action[current_player] = 0
-  agent.end_episode(reward_since_last_action)
-
-  tf.logging.info('EPISODE: %d %g %s', step_number, total_reward,str(actioned))
+  act_loss,val_loss = agent.end_episode(reward_since_last_action)
+  if not eval:
+    for i, (a, v) in enumerate(zip(act_loss, val_loss)):
+        avg_act_loss[i].append(a)
+        avg_val_loss[i].append(v)
+    agent.episode += 1
+    avg_act_loss = np.mean(avg_act_loss,axis=1)
+    avg_val_loss = np.mean(avg_val_loss, axis=1)
+    agent.writer.add_scalar('score',total_reward,agent.episode)
+    agent.writer.add_scalar('length',step_number,agent.episode)
+    for i in range(environment.players):
+      agent.writer.add_scalar('action_loss/agent_{}'.format(i),avg_act_loss[i],agent.episode)
+      agent.writer.add_scalar('value_loss/agent_{}'.format(i),avg_val_loss[i],agent.episode)
+      agent.writer.add_scalar('action_mean/agent_{}'.format(i),np.mean(actioned[i]),agent.episode)
+      agent.writer.add_scalar('action_var/agent_{}'.format(i),np.std(actioned[i]),agent.episode)
+  tf.logging.info('EPISODE: %d %g', step_number, total_reward)
   return step_number, total_reward
 
 
@@ -370,7 +394,6 @@ def run_one_phase(agent, environment, obs_stacker, min_steps, statistics,
         '{}_episode_lengths'.format(run_mode_str): episode_length,
         '{}_episode_returns'.format(run_mode_str): episode_return
     })
-
     step_count += episode_length
     sum_returns += episode_return
     num_episodes += 1
@@ -423,7 +446,7 @@ def run_one_iteration(agent, environment, obs_stacker,
     agent.eval_mode = True
     # Collect episode data for all games.
     for _ in range(num_evaluation_games):
-      episode_data.append(run_one_episode(agent, environment, obs_stacker))
+      episode_data.append(run_one_episode(agent, environment, obs_stacker,eval=True))
 
     eval_episode_length, eval_episode_return = map(np.mean, zip(*episode_data))
 

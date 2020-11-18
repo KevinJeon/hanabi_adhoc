@@ -5,7 +5,6 @@ from __future__ import print_function
 import numpy as np
 import torch as tr
 import torch.nn as nn
-import torch.nn.functional as F
 from torch.optim import Adam
 from replay_memory import RolloutStorage
 from torch.distributions import Categorical
@@ -44,7 +43,7 @@ class Policy(nn.Module):
   def act(self, observations, legal_actions):
     v = self.critic_linear(self.critic(observations))
     h_a = self.actor(observations)
-    act_probs = F.sigmoid(self.actor_linear(h_a))
+    act_probs = tr.sigmoid(self.actor_linear(h_a))
     act_probs[legal_actions != 0] = 0
     dist = Categorical(act_probs)
     action = dist.sample().unsqueeze(-1)
@@ -58,9 +57,9 @@ class Policy(nn.Module):
   def evaluate_actions(self, observations,action):
     v = self.critic_linear(self.critic(observations))
     h_a = self.actor(observations)
-    dist = self.dist(h_a)
-
-    action_log_probs = dist.log_probs(action)
+    act_probs = tr.sigmoid(self.actor_linear(h_a))
+    dist = Categorical(act_probs)
+    action_log_probs = dist.log_prob(action)
     dist_entropy = dist.entropy().mean()
 
     return v, action_log_probs, dist_entropy
@@ -98,35 +97,49 @@ class DBPLAgent(object):
     self.k = 4
     self.batch_size = 640
     self.iter = [0]*2
+    self.episode = 0
   def step(self,reward,current_player,legal_moves,observation_vector,is_done,begin=False):
 
-    self._train()
+    act_loss,val_loss = self._train()
     # train step
     value, self.action, logprobs  = self._select_action(current_player,observation_vector,legal_moves)
-    
-    return value, self.action, logprobs
+    mask = tr.FloatTensor([0.0] if is_done else [1.0])
+    if begin:
+        self.memory.insert(current_player,observation_vector,self.action,logprobs,value,
+                           0,begin)
+    else:
+        self.memory.insert(current_player,observation_vector,self.action,logprobs,value,
+                           reward)
+    return value, self.action, logprobs,act_loss,val_loss
 
   def end_episode(self,reward_since_last_action):
-    self._train(end=True)
+    for i in range(self.num_player):
+      self.memory.last_insert(reward_since_last_action)
+    act_loss,val_loss = self._train(end=True)
+    return act_loss,val_loss
 
   def _train(self,end=False):
     if self.eval_mode:
-      return
+      return None,None
     if (self.memory.step >= self.batch_size) or (end == True):
       #print('end',end,'memory_count',self.memory.add_count)
+      act_losses,val_losses = [],[]
       for i in range(self.num_player):
+        with tr.no_grad():
+          next_value = self.policy_modules[i].get_value(self.memory.obss[i][-1])
+        self.memory.compute_returns(i, next_value, use_gae=True, gamma=self.gamma, gae_lambda=0.95)
         self.iter[i] += 1
-        advantages = self.memory.returns[i][:-1] - self.memory.value_preds[i][:-1]
+        advantages = self.memory.rets[i][:-1] - self.memory.value_preds[i][:-1]
         advantages = (advantages - advantages.mean())/ (advantages.std()+1e-5)
         # train policy module
         avg_val_loss = 0
         avg_act_loss = 0
         avg_dist = 0
         for _ in range(self.k):
-          sampler = self.memory.feed_forward_generator(advantages,self.batch_size)
+          sampler = self.memory.feed_forward_generator(i,advantages)
           for sample in sampler:
             obss,acts,val_preds,rets,masks,old_probs,adv_targ = sample
-            vals,log_probs,dist_entropy,_ = self.policy_modules[i].evaluate_actions(obss,masks,acts)
+            vals,log_probs,dist_entropy = self.policy_modules[i].evaluate_actions(obss,acts)
             ratio = tr.exp(log_probs-old_probs.detach())
             surr_loss1 = ratio*adv_targ
             surr_loss2 = tr.clamp(ratio,1-self.clip_param,1+self.clip_param)*adv_targ
@@ -142,25 +155,25 @@ class DBPLAgent(object):
             self.p_optim[i].zero_grad()
             (value_loss * self.value_loss_coef + action_loss -
              dist_entropy * self.entropy_coef).backward()
-            nn.utils.clip_grad_norm_(self.actor_critic.parameters(),
+            nn.utils.clip_grad_norm_(self.policy_modules[i].parameters(),
                                      self.max_grad_norm)
             self.p_optim[i].step()
             avg_val_loss += value_loss.item()
             avg_dist += dist_entropy.item()
             avg_act_loss += action_loss.item()
-        avg_val_loss /= self.k*self.batch_size
-        avg_act_loss /= self.k*self.batch_size
+        avg_val_loss /= self.k * self.batch_size
+        avg_act_loss /= self.k * self.batch_size
         avg_dist /= self.k * self.batch_size
-        self.writer.add_scalar('action_loss/agent{}'.format(i), avg_act_loss,self.iter[i])
-        self.writer.add_scalar('value_loss/agent{}'.format(i), avg_val_loss,self.iter[i])
-        self.writer.add_scalar('entropy/agent{}'.format(i), avg_dist, self.iter[i])
+        act_losses.append(avg_act_loss)
+        val_losses.append(avg_val_loss)
         #print('agent : {} policy loss : {} belief loss : {}'.format(i,loss.mean().item(),kl_loss.mean().item()))
-        self.old_policy_modules[i].load_state_dict(self.policy_modules[i].state_dict())
       self.memory.after_update()
+      return act_losses,val_losses
+    else:
+      return None,None
   def _select_action(self,current_player,observation,legal_actions):
     observation = tr.from_numpy(observation).float().cuda()
     with tr.no_grad():
-      value,action,log_probs = self.old_policy_modules[current_player].act(observation,legal_actions)
-    print(value.size(),action.size(),log_probs.size())
+      value,action,log_probs = self.policy_modules[current_player].act(observation,legal_actions)
     return value,action,log_probs
 
