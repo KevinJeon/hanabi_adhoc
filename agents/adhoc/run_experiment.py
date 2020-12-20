@@ -124,7 +124,6 @@ def create_environment(game_type='Hanabi-Full', num_players=2):
   Returns:
     A Hanabi environment.
   """
-  print('game_type',game_type,num_players)
   return rl_env.make(
       environment_name=game_type, num_players=num_players, pyhanabi_path=None)
 
@@ -166,7 +165,6 @@ def create_agent(environment, obs_stacker, agent_type='DQN'):
                               num_actions=environment.num_moves(),
                               num_players=environment.players)
   elif agent_type == 'Rainbow':
-    print(obs_stacker.observation_size())
     return rainbow_agent.RainbowAgent(
         observation_size=obs_stacker.observation_size(),
         num_actions=environment.num_moves(),

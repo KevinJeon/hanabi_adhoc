@@ -41,7 +41,7 @@ def rainbow_template(state,
                      num_actions,
                      num_atoms=51,
                      layer_size=512,
-                     num_layers=1):
+                     num_layers=2):
   r"""Builds a Rainbow Network mapping states to value distributions.
 
   Args:
@@ -92,7 +92,7 @@ class RainbowAgent(dqn_agent.DQNAgent):
                epsilon_decay_period=1000,
                learning_rate=0.000025,
                optimizer_epsilon=0.00003125,
-               tf_device='/gpu:*'):
+               tf_device='/cpu:*'):
     """Initializes the agent and constructs its graph.
 
     Args:
@@ -138,6 +138,7 @@ class RainbowAgent(dqn_agent.DQNAgent):
         epsilon_decay_period=epsilon_decay_period,
         graph_template=graph_template,
         tf_device=tf_device)
+    tf.logging.info('\t device:{}'.format(tf_device))
     tf.logging.info('\t learning_rate: %f', learning_rate)
     tf.logging.info('\t optimizer_epsilon: %f', optimizer_epsilon)
 

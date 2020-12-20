@@ -203,7 +203,7 @@ class DQNAgent(object):
     self._init_op = tf.global_variables_initializer()
     self._sess.run(self._init_op)
 
-    self._saver = tf.train.Saver(max_to_keep=3)
+    self._saver = tf.train.Saver(max_to_keep=3,save_relative_paths=True)
 
     # This keeps tracks of the observed transitions during play, for each
     # player.

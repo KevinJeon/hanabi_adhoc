@@ -33,7 +33,9 @@ import gin.tf
 import numpy as np
 import replay_memory
 import tensorflow as tf
+import tensorflow_probability as tfp
 
+tfd = tfp.distributions
 
 slim = tf.contrib.slim
 
@@ -58,8 +60,8 @@ def linearly_decaying_epsilon(decay_period, step, warmup_steps, epsilon):
   bonus = np.clip(bonus, 0.0, 1.0 - epsilon)
   return epsilon + bonus
 
-
-def dqn_template(state, num_actions, layer_size=512, num_layers=1):
+@gin.configurable
+def ppo_template(state, num_actions, layer_size=512, num_layers=1):
   r"""Builds a DQN Network mapping states to Q-values.
 
   Args:
@@ -77,16 +79,24 @@ def dqn_template(state, num_actions, layer_size=512, num_layers=1):
 
   net = tf.cast(state, tf.float32)
   net = tf.squeeze(net, axis=2)
-  for _ in range(num_layers):
-    net = slim.fully_connected(net, layer_size,
-                               activation_fn=tf.nn.relu)
-  net = slim.fully_connected(net, num_actions, activation_fn=None,
+  critic = slim.fully_connected(net, layer_size,
+                             activation_fn=tf.nn.tanh)
+  actor = slim.fully_connected(net, layer_size,
+                              activation_fn=tf.nn.tanh)
+  for _ in range(num_layers-1):
+    critic = slim.fully_connected(critic, layer_size,
+                               activation_fn=tf.nn.tanh)
+    actor = slim.fully_connected(actor, layer_size,
+                                activation_fn=tf.nn.tanh)
+  critic = slim.fully_connected(critic, 1, activation_fn=None,
                              weights_initializer=weights_initializer)
-  return net
+  actor = slim.fully_connected(actor, num_actions, activation_fn=tf.nn.softmax,
+                              weights_initializer=weights_initializer)
+  return critic, actor
 
 
 @gin.configurable
-class DQNAgent(object):
+class PPOAgent(object):
   """A compact implementation of the multiplayer DQN agent."""
 
   @gin.configurable
@@ -104,7 +114,7 @@ class DQNAgent(object):
                epsilon_train=0.02,
                epsilon_eval=0.001,
                epsilon_decay_period=1000,
-               graph_template=dqn_template,
+               graph_template=ppo_template,
                tf_device='/gpu:*',
                use_staging=True,
                optimizer=tf.train.RMSPropOptimizer(
@@ -172,12 +182,17 @@ class DQNAgent(object):
     self.batch_staged = False
     self.optimizer = optimizer
 
+    # ppo variables
+    self.k = 3
+    self.eps_clip = 0.2
+
     with tf.device(tf_device):
       # Calling online_convnet will generate a new graph as defined in
       # graph_template using whatever input is passed, but will always share
       # the same weights.
       online_convnet = tf.make_template('Online', graph_template)
-      target_convnet = tf.make_template('Target', graph_template)
+
+      old_convnet = tf.make_template('Old', graph_template)
       # The state of the agent. The last axis is the number of past observations
       # that make up the state.
       states_shape = (1, observation_size, stack_size)
@@ -186,16 +201,19 @@ class DQNAgent(object):
       self.legal_actions_ph = tf.placeholder(tf.float32,
                                              [self.num_actions],
                                              name='legal_actions_ph')
-      self._q = online_convnet(
+      # to decide action, using placeholder
+      self.old_ppo = old_convnet(
           state=self.state_ph, num_actions=self.num_actions)
+      self.ppo = online_convnet(
+          state=self.state_ph, num_actions=self.num_actions)
+
       self._replay = self._build_replay_memory(use_staging)
       self._replay_qs = online_convnet(self._replay.states, self.num_actions)
-      self._replay_next_qt = target_convnet(self._replay.next_states,
+      self._replay_next_qt = old_convnet(self._replay.next_states,
                                             self.num_actions)
       self._train_op = self._build_train_op()
       self._sync_qt_ops = self._build_sync_op()
 
-      self._q_argmax = tf.argmax(self._q + self.legal_actions_ph, axis=1)[0]
 
     # Set up a session and initialize variables.
     self._sess = tf.Session(
@@ -396,26 +414,20 @@ class DQNAgent(object):
     Returns:
       action: int, a legal action.
     """
-    if self.eval_mode:
-      epsilon = self.epsilon_eval
-    else:
-      epsilon = self.epsilon_fn(self.epsilon_decay_period, self.training_steps,
-                                self.min_replay_history, self.epsilon_train)
-
-    if random.random() <= epsilon:
-      # Choose a random action with probability epsilon.
-      legal_action_indices = np.where(legal_actions == 0.0)
-      return np.random.choice(legal_action_indices[0])
-    else:
-      # Convert observation into a batch-based format.
-      self.state[0, :, 0] = observation
-
-      # Choose the action maximizing the q function for the current state.
-      action = self._sess.run(self._q_argmax,
+    self.state[0, :, 0] = observation
+    act_prob = self.old_ppo[1]
+    act_prob = act_prob + self.legal_actions_ph
+    dist = tfd.Categorical(act_prob)
+    action = dist.sample()
+    log_prob = dist.log_prob(action)
+    action = self._sess.run(action,
                               {self.state_ph: self.state,
                                self.legal_actions_ph: legal_actions})
-      assert legal_actions[action] == 0.0, 'Expected legal action.'
-      return action
+    log_prob = self._sess.run(log_prob,
+                            {self.state_ph: self.state,
+                             self.legal_actions_ph: legal_actions})
+    assert legal_actions[action] == 0.0, 'Expected legal action.'
+    return action, log_prob
 
   def _train_step(self):
     """Runs a single training step.

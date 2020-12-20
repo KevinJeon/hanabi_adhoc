@@ -71,7 +71,7 @@ def launch_experiment():
   - Run the experiment.
   """
   if FLAGS.base_dir == None:
-    raise ValueError('--base_dir is None: please provide a path for '
+    raise ValueError('--base_dir is None please provide a path for '
                      'logs and checkpoints.')
 
   run_experiment.load_gin_configs(FLAGS.gin_files, FLAGS.gin_bindings)

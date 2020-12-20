@@ -33,7 +33,9 @@ import gin.tf
 import numpy as np
 import replay_memory
 import tensorflow as tf
+import tensorflow_probability as tfp
 
+tfd = tfp.distributions
 
 slim = tf.contrib.slim
 
@@ -58,8 +60,8 @@ def linearly_decaying_epsilon(decay_period, step, warmup_steps, epsilon):
   bonus = np.clip(bonus, 0.0, 1.0 - epsilon)
   return epsilon + bonus
 
-
-def dqn_template(state, num_actions, layer_size=512, num_layers=1):
+@gin.configurable
+def value_template(state, num_actions, layer_size=512, num_layers=1):
   r"""Builds a DQN Network mapping states to Q-values.
 
   Args:
@@ -77,16 +79,53 @@ def dqn_template(state, num_actions, layer_size=512, num_layers=1):
 
   net = tf.cast(state, tf.float32)
   net = tf.squeeze(net, axis=2)
+  net1 = slim.fully_connected(net, layer_size,
+                             activation_fn=tf.nn.relu)
+  net2 = slim.fully_connected(net, layer_size,
+                              activation_fn=tf.nn.relu)
+  for _ in range(num_layers-1):
+    net1 = slim.fully_connected(net1, layer_size,
+                               activation_fn=tf.nn.relu)
+    net2 = slim.fully_connected(net2, layer_size,
+                                activation_fn=tf.nn.relu)
+  net1 = slim.fully_connected(net1, num_actions, activation_fn=None,
+                             weights_initializer=weights_initializer)
+  net2 = slim.fully_connected(net2, num_actions, activation_fn=None,
+                              weights_initializer=weights_initializer)
+  return net1, net2
+
+@gin.configurable
+def actor_template(state, num_actions, layer_size=512, num_layers=1):
+  r"""Builds a DQN Network mapping states to Q-values.
+
+  Args:
+    state: A `tf.placeholder` for the RL state.
+    num_actions: int, number of actions that the RL agent can take.
+    layer_size: int, number of hidden units per layer.
+    num_layers: int, Number of hidden layers.
+
+  Returns:
+    net: A `tf.Graphdef` for DQN:
+      `\theta : \mathcal{X}\rightarrow\mathbb{R}^{|\mathcal{A}|}`
+  """
+  weights_initializer = slim.variance_scaling_initializer(
+      factor=1.0 / np.sqrt(3.0), mode='FAN_IN', uniform=True)
+  log_sig_max = 2
+  log_sig_min = -20
+  net = tf.cast(state, tf.float32)
+  net = tf.squeeze(net, axis=2)
   for _ in range(num_layers):
     net = slim.fully_connected(net, layer_size,
                                activation_fn=tf.nn.relu)
-  net = slim.fully_connected(net, num_actions, activation_fn=None,
+  mean = slim.fully_connected(net, num_actions, activation_fn=None,
                              weights_initializer=weights_initializer)
-  return net
-
+  log_std = slim.fully_connected(net,num_actions, activation_fn=None,
+                             weights_initializer=weights_initializer)
+  log_std = tf.clip_by_value(log_std, clip_value_min=log_sig_min, clip_value_max=log_sig_max)
+  return mean,log_std
 
 @gin.configurable
-class DQNAgent(object):
+class SACAgent(object):
   """A compact implementation of the multiplayer DQN agent."""
 
   @gin.configurable
@@ -104,7 +143,7 @@ class DQNAgent(object):
                epsilon_train=0.02,
                epsilon_eval=0.001,
                epsilon_decay_period=1000,
-               graph_template=dqn_template,
+               graph_template=[value_template,actor_template],
                tf_device='/gpu:*',
                use_staging=True,
                optimizer=tf.train.RMSPropOptimizer(
@@ -176,8 +215,10 @@ class DQNAgent(object):
       # Calling online_convnet will generate a new graph as defined in
       # graph_template using whatever input is passed, but will always share
       # the same weights.
-      online_convnet = tf.make_template('Online', graph_template)
-      target_convnet = tf.make_template('Target', graph_template)
+      value_convnet = tf.make_template('Value', value_template)
+      actor_convnet = tf.make_template('Actor', actor_template)
+
+      target_convnet = tf.make_template('Target', value_template)
       # The state of the agent. The last axis is the number of past observations
       # that make up the state.
       states_shape = (1, observation_size, stack_size)
@@ -186,10 +227,14 @@ class DQNAgent(object):
       self.legal_actions_ph = tf.placeholder(tf.float32,
                                              [self.num_actions],
                                              name='legal_actions_ph')
-      self._q = online_convnet(
+      self._q = value_convnet(
+          state=self.state_ph, num_actions=self.num_actions)
+      self.critic = value_convnet(
+          state=self.state_ph, num_actions=self.num_actions)
+      self.actor = actor_convnet(
           state=self.state_ph, num_actions=self.num_actions)
       self._replay = self._build_replay_memory(use_staging)
-      self._replay_qs = online_convnet(self._replay.states, self.num_actions)
+      self._replay_qs = value_convnet(self._replay.states, self.num_actions)
       self._replay_next_qt = target_convnet(self._replay.next_states,
                                             self.num_actions)
       self._train_op = self._build_train_op()
@@ -381,7 +426,11 @@ class DQNAgent(object):
       # Now that this episode has been stored, drop it from the transitions
       # buffer.
       self.transitions[player] = []
-
+''
+import tensorflow as tf
+from tf_agents.networks import q_network
+from tf_agents.agents.dqn import dqn_agent
+''
   def _select_action(self, observation, legal_actions):
     """Select an action from the set of allowed actions.
 
@@ -396,26 +445,24 @@ class DQNAgent(object):
     Returns:
       action: int, a legal action.
     """
-    if self.eval_mode:
-      epsilon = self.epsilon_eval
-    else:
-      epsilon = self.epsilon_fn(self.epsilon_decay_period, self.training_steps,
-                                self.min_replay_history, self.epsilon_train)
-
-    if random.random() <= epsilon:
-      # Choose a random action with probability epsilon.
-      legal_action_indices = np.where(legal_actions == 0.0)
-      return np.random.choice(legal_action_indices[0])
-    else:
-      # Convert observation into a batch-based format.
-      self.state[0, :, 0] = observation
-
+    self.state[0, :, 0] = observation
+    mean, log_std = self.actor[0], self.actor[1]
+    std = tf.math.exp(log_std)
+    if not self.eval_mode:
+      mean += tf.random.Normal(shape=mean.shape,dtype=tf.float64) * std
+    log_prob = tfd.Normal(loc=mean, scale=std).log_prob(mean)
+    action = tf.math.tanh(mean)
+    action = action * action_scale + action_bias
+    log_prob = tf.reduce_sum(log_prob - tf.math.log(1 - action ** 2 + eps))
       # Choose the action maximizing the q function for the current state.
-      action = self._sess.run(self._q_argmax,
+    action = self._sess.run(action,
                               {self.state_ph: self.state,
                                self.legal_actions_ph: legal_actions})
-      assert legal_actions[action] == 0.0, 'Expected legal action.'
-      return action
+    log_prob = self._sess.run(log_prob,
+                            {self.state_ph: self.state,
+                             self.legal_actions_ph: legal_actions})
+    assert legal_actions[action] == 0.0, 'Expected legal action.'
+    return action, log_prob
 
   def _train_step(self):
     """Runs a single training step.
