@@ -186,11 +186,11 @@ class DQNAgent(object):
       self.legal_actions_ph = tf.placeholder(tf.float32,
                                              [self.num_actions],
                                              name='legal_actions_ph')
-      self._q = online_convnet(
+      self._q,self._prevs = online_convnet(
           state=self.state_ph, num_actions=self.num_actions)
       self._replay = self._build_replay_memory(use_staging)
-      self._replay_qs = online_convnet(self._replay.states, self.num_actions)
-      self._replay_next_qt = target_convnet(self._replay.next_states,
+      self._replay_qs,_ = online_convnet(self._replay.states, self.num_actions)
+      self._replay_next_qt,_ = target_convnet(self._replay.next_states,
                                             self.num_actions)
       self._train_op = self._build_train_op()
       self._sync_qt_ops = self._build_sync_op()
@@ -202,7 +202,6 @@ class DQNAgent(object):
         '', config=tf.ConfigProto(allow_soft_placement=True))
     self._init_op = tf.global_variables_initializer()
     self._sess.run(self._init_op)
-
     self._saver = tf.train.Saver(max_to_keep=3,save_relative_paths=True)
 
     # This keeps tracks of the observed transitions during play, for each

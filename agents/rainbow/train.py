@@ -36,7 +36,7 @@ FLAGS = flags.FLAGS
 flags.DEFINE_multi_string(
     'gin_files', [],
     'List of paths to gin configuration files (e.g.'
-    '"configs/hanabi_rainbow.gin").')
+    '"configs/hanabi_sac.gin").')
 flags.DEFINE_multi_string(
     'gin_bindings', [],
     'Gin bindings to override the values set in the config files '

@@ -71,6 +71,6 @@ for i,agent_id1 in enumerate(agents_id):
 
 score = dict(mat=total_rewards)
 print(total_rewards)
-import json,io
-with io.open('score.json','w',encoding='utf-8') as f:
+import json
+with open('score.json','w',encoding='utf-8') as f:
     json.dump(score,f)

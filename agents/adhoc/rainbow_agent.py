@@ -61,14 +61,15 @@ def rainbow_template(state,
 
   net = tf.cast(state, tf.float32)
   net = tf.squeeze(net, axis=2)
-
+  nets = []
   for _ in range(num_layers):
     net = slim.fully_connected(net, layer_size,
                                activation_fn=tf.nn.relu)
+    nets.append(net)
   net = slim.fully_connected(net, num_actions * num_atoms, activation_fn=None,
                              weights_initializer=weights_initializer)
   net = tf.reshape(net, [-1, num_actions, num_atoms])
-  return net
+  return net, nets
 
 
 @gin.configurable
@@ -141,7 +142,6 @@ class RainbowAgent(dqn_agent.DQNAgent):
     tf.logging.info('\t device:{}'.format(tf_device))
     tf.logging.info('\t learning_rate: %f', learning_rate)
     tf.logging.info('\t optimizer_epsilon: %f', optimizer_epsilon)
-
   def _build_replay_memory(self, use_staging):
     """Creates the replay memory used by the agent.
 
